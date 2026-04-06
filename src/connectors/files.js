@@ -6,20 +6,22 @@ function startsWithPath(candidate, prefix) {
   return rel && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
-export function createFilesConnector({ rootDir, allowList = [] }) {
+export function createFilesConnector({ rootDir, allowList = [] } = {}) {
+  const defaultRoot = rootDir || process.env.FILES_ROOT || process.cwd();
   const allowedRoots = (allowList.length ? allowList : [rootDir])
     .filter(Boolean)
-    .map((p) => path.resolve(rootDir, p));
+    .map((p) => path.resolve(defaultRoot, p));
 
   function assertAllowed(filePath) {
-    const abs = path.resolve(rootDir, filePath);
+    const abs = path.resolve(defaultRoot, filePath);
     const ok = allowedRoots.some((r) => abs === r || startsWithPath(abs, r));
     if (!ok) throw new Error('File path not allowed by policy');
     return abs;
   }
 
   return {
-    name: 'files',
+    id: 'files',
+    readOnly: false,
     capabilities: ['read'],
     async poll() {
       return [];

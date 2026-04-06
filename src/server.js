@@ -1,11 +1,7 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createAgent } from './agentRuntime.js';
-import { createMoltbookConnector } from './connectors/moltbook.js';
-import { createGitHubConnector } from './connectors/github.js';
-import { createWebConnector } from './connectors/web.js';
-import { createFilesConnector } from './connectors/files.js';
+import { createRuntime } from './agentRuntime.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,27 +9,20 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-const agent = createAgent({
-  connectors: [
-    createMoltbookConnector(),
-    createGitHubConnector(),
-    createWebConnector(),
-    createFilesConnector(),
-  ],
-});
-agent.start();
+const runtime = createRuntime();
+runtime.loop();
 
 app.get('/health', async (req, res) => {
-  res.json({ ok: true, status: agent.getStatus() });
+  res.json({ ok: true, status: runtime.getStatus() });
 });
 
 app.get('/api/status', async (req, res) => {
-  res.json({ ok: true, status: agent.getStatus() });
+  res.json({ ok: true, status: runtime.getStatus() });
 });
 
 app.post('/api/approve', async (req, res) => {
   try {
-    const result = await agent.approveToday();
+    const result = await runtime.approveForToday();
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -42,8 +31,7 @@ app.post('/api/approve', async (req, res) => {
 
 app.post('/api/actions/execute', async (req, res) => {
   try {
-    const { ids } = req.body || {};
-    const result = await agent.executeActions(Array.isArray(ids) ? ids : null);
+    const result = await runtime.executePendingActions();
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -53,7 +41,7 @@ app.post('/api/actions/execute', async (req, res) => {
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, question } = req.body || {};
-    const result = await agent.answer(String(question || message || ''));
+    const result = await runtime.chat(String(question || message || ''));
     res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });

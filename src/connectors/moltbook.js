@@ -36,13 +36,9 @@ const ConfigSchema = z.object({
   maxCommentsPerPost: z.number().int().min(0).max(200).default(50),
 });
 
-export const moltbookConnector = {
-  id: 'moltbook',
-  displayName: 'Moltbook',
-  readOnly: false,
-
-  getConfig(env) {
-    const parsed = ConfigSchema.parse({
+export function createMoltbookConnector() {
+  function getConfig(env) {
+    return ConfigSchema.parse({
       baseUrl: env.MOLTBOOK_BASE_URL || undefined,
       apiKey: env.MOLTBOOK_AGENT_API_KEY || env.MOLTBOOK_API_KEY || undefined,
       sort: env.MOLTBOOK_SORT || undefined,
@@ -51,133 +47,135 @@ export const moltbookConnector = {
         ? Number(env.MOLTBOOK_MAX_COMMENTS_PER_POST)
         : undefined,
     });
-    return parsed;
-  },
+  }
 
-  async poll({ env, memory, logger }) {
-    const cfg = this.getConfig(env);
-    const authHeaders = { Authorization: `Bearer ${cfg.apiKey}` };
+  return {
+    id: 'moltbook',
+    readOnly: false,
 
-    const lastSeenIso = memory.getState('moltbook.lastPostSeenAt', null);
-    const lastSeenDate = lastSeenIso ? new Date(lastSeenIso) : null;
+    async poll({ db, env = process.env, logger = console }) {
+      const conf = getConfig(env);
+      const authHeaders = { Authorization: `Bearer ${conf.apiKey}` };
 
-    const postsUrl = buildUrl(cfg.baseUrl, '/posts', { sort: cfg.sort, limit: cfg.maxPosts });
-    const postsResp = await httpJson(postsUrl, { headers: authHeaders });
-    const posts = Array.isArray(postsResp?.posts) ? postsResp.posts : Array.isArray(postsResp) ? postsResp : [];
+      const lastSeenIso = getStateFromRuntime(db, 'moltbook.lastPostSeenAt', null);
+      const lastSeenDate = lastSeenIso ? new Date(lastSeenIso) : null;
 
-    const newPosts = lastSeenDate
-      ? posts.filter((p) => {
-          const d = new Date(p.updated_at || p.created_at || 0);
-          return Number.isFinite(d.getTime()) && d > lastSeenDate;
-        })
-      : posts;
+      const postsUrl = buildUrl(conf.baseUrl, '/posts', { sort: conf.sort, limit: conf.maxPosts });
+      const postsResp = await httpJson(postsUrl, { headers: authHeaders });
+      const posts = Array.isArray(postsResp?.posts)
+        ? postsResp.posts
+        : Array.isArray(postsResp)
+          ? postsResp
+          : [];
 
-    const items = [];
-    for (const post of newPosts) {
-      const postId = post.id || post._id;
-      if (!postId) continue;
+      const newPosts = lastSeenDate
+        ? posts.filter((p) => {
+            const d = new Date(p.updated_at || p.created_at || 0);
+            return Number.isFinite(d.getTime()) && d > lastSeenDate;
+          })
+        : posts;
 
-      let comments = [];
-      try {
-        const commentsUrl = buildUrl(cfg.baseUrl, `/posts/${encodeURIComponent(postId)}/comments`, {
-          sort: 'new',
-          limit: cfg.maxCommentsPerPost,
+      const items = [];
+      for (const post of newPosts) {
+        const postId = post.id || post._id;
+        if (!postId) continue;
+
+        let comments = [];
+        try {
+          const commentsUrl = buildUrl(conf.baseUrl, `/posts/${encodeURIComponent(postId)}/comments`, {
+            sort: 'new',
+            limit: conf.maxCommentsPerPost,
+          });
+          const commentsResp = await httpJson(commentsUrl, { headers: authHeaders });
+          comments = Array.isArray(commentsResp?.comments)
+            ? commentsResp.comments
+            : Array.isArray(commentsResp)
+              ? commentsResp
+              : [];
+        } catch (e) {
+          logger.warn?.(
+            `[moltbook] comments fetch failed for post=${postId}: ${String(e?.message || e)}`
+          );
+          comments = [];
+        }
+
+        const parts = [];
+        if (post.title) parts.push(String(post.title));
+        if (post.content) parts.push(String(post.content));
+
+        for (const c of comments) {
+          const author =
+            c.author?.name ||
+            c.author?.id ||
+            c.author ||
+            c.user?.name ||
+            c.user?.id ||
+            c.user ||
+            'unknown';
+          const content = c.content || c.text || '';
+          if (content) parts.push(`${author}: ${content}`.trim());
+        }
+
+        items.push({
+          id: `moltbook:post:${String(postId)}`,
+          title: post.title || '',
+          content: parts.join('\n'),
+          url: post.url || post.permalink || '',
+          created_at: post.updated_at || post.created_at || null,
+          raw: { post, comments },
         });
-        const commentsResp = await httpJson(commentsUrl, { headers: authHeaders });
-        comments = Array.isArray(commentsResp?.comments) ? commentsResp.comments : Array.isArray(commentsResp) ? commentsResp : [];
-      } catch (e) {
-        logger.warn(`[moltbook] comments fetch failed for post=${postId}: ${String(e?.message || e)}`);
-        comments = [];
       }
 
-      const parts = [];
-      if (post.title) parts.push(String(post.title));
-      if (post.content) parts.push(String(post.content));
+      const newest = posts
+        .map((p) => new Date(p.updated_at || p.created_at || 0))
+        .filter((d) => Number.isFinite(d.getTime()))
+        .sort((a, b) => b - a)[0];
 
-      for (const c of comments) {
-        const author =
-          c.author?.name || c.author?.id || c.author || c.user?.name || c.user?.id || c.user || 'unknown';
-        const content = c.content || c.text || '';
-        if (content) parts.push(`${author}: ${content}`.trim());
+      if (newest) {
+        setStateInRuntime(db, 'moltbook.lastPostSeenAt', newest.toISOString());
       }
 
-      items.push({
-        source: 'moltbook',
-        id: String(postId),
-        title: post.title || '',
-        content: parts.join('\n'),
-        url: post.url || post.permalink || '',
-        created_at: post.updated_at || post.created_at || null,
-        raw: { post, comments },
-      });
-    }
+      return items;
+    },
 
-    const newest = posts
-      .map((p) => new Date(p.updated_at || p.created_at || 0))
-      .filter((d) => Number.isFinite(d.getTime()))
-      .sort((a, b) => b - a)[0];
+    async executeAction({ env = process.env, action }) {
+      const conf = getConfig(env);
+      const apiKey = conf.apiKey;
+      const baseUrl = conf.baseUrl;
 
-    if (newest) {
-      memory.setState('moltbook.lastPostSeenAt', newest.toISOString());
-    }
+      if (action.action_type === 'moltbook.post') {
+        const { submolt, title, content, url } = action.payload || {};
+        const postUrl = buildUrl(baseUrl, '/posts');
+        return httpJson(postUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ submolt, title, content, url }),
+        });
+      }
 
-    return {
-      ok: true,
-      connector: this.id,
-      scanned: posts.length,
-      newItems: items.length,
-      items,
-    };
-  },
+      if (action.action_type === 'moltbook.upvote') {
+        const postId = action.payload?.postId;
+        if (!postId) throw new Error('Missing payload.postId');
+        const upvoteUrl = buildUrl(baseUrl, `/posts/${encodeURIComponent(postId)}/upvote`);
+        return httpJson(upvoteUrl, { method: 'POST', headers: { Authorization: `Bearer ${apiKey}` } });
+      }
 
-  async proposeActions({ env, memory }) {
-    const cfg = this.getConfig(env);
-    const latest = memory.getLatestReport();
-    if (!latest) return [];
+      throw new Error(`Unsupported Moltbook action: ${action.action_type}`);
+    },
+  };
+}
 
-    // Simple heuristic: if unsatisfied requests are present, propose posting a brief summary.
-    const hasRequests = (latest.matches || []).some((m) =>
-      (m.mentions || []).some((mm) => mm.category === 'unsatisfiedRequests')
-    );
-    if (!hasRequests) return [];
+function getStateFromRuntime(db, key, fallback) {
+  const row = db.prepare('SELECT value FROM state WHERE key = ?').get(key);
+  return row ? row.value : fallback;
+}
 
-    const top = (latest.matches || []).slice(0, 5).map((m) => ({
-      title: m.title,
-      url: m.url,
-      mentions: (m.mentions || []).slice(0, 3),
-    }));
-
-    return [
-      {
-        connector: 'moltbook',
-        type: 'moltbook.createPost',
-        summary: 'Post daily summary of top unsatisfied requests',
-        payload: {
-          baseUrl: cfg.baseUrl,
-          apiKey: cfg.apiKey,
-          submolt: env.MOLTBOOK_POST_SUBMOLT || 'general',
-          title: env.MOLTBOOK_POST_TITLE || 'Daily agent summary: requests & gaps',
-          content: `Top items:\\n\\n${top
-            .map((t, i) => `${i + 1}. ${t.title || '(no title)'} ${t.url ? `(${t.url})` : ''}`)
-            .join('\\n')}`,
-        },
-      },
-    ];
-  },
-
-  async executeAction({ action }) {
-    if (action.type !== 'moltbook.createPost') throw new Error('Unsupported action type');
-    const { baseUrl, apiKey, submolt, title, content, url } = action.payload || {};
-    if (!apiKey) throw new Error('Missing Moltbook API key');
-    const postUrl = buildUrl(baseUrl, '/posts');
-    return httpJson(postUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({ submolt, title, content, url }),
-    });
-  },
-};
+function setStateInRuntime(db, key, value) {
+  db.prepare(
+    'INSERT INTO state (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at'
+  ).run(key, String(value), new Date().toISOString());
+}
 

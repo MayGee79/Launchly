@@ -51,7 +51,7 @@ export function createGitHubConnector({ repo = null } = {}) {
         return { ok: false, error: e?.message || String(e) };
       }
     },
-    async act({ action, logger }) {
+    async executeAction({ action, logger }) {
       if (!action) throw new Error('action is required');
       if (action.type !== 'github.comment') throw new Error('Unsupported GitHub action');
       const repoArg = repo ? ['--repo', repo] : [];

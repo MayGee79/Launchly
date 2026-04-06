@@ -1,6 +1,12 @@
 import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import path from 'node:path';
 
 export function openStore(dbPath) {
+  const dir = path.dirname(dbPath);
+  if (dir && dir !== '.' && !fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
 
@@ -46,6 +52,16 @@ export function openStore(dbPath) {
       message TEXT,
       data_json TEXT,
       FOREIGN KEY(action_id) REFERENCES actions(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS embeddings (
+      id TEXT PRIMARY KEY,
+      connector TEXT,
+      created_at TEXT,
+      title TEXT,
+      url TEXT,
+      text TEXT NOT NULL,
+      vector_json TEXT NOT NULL
     );
   `);
 
@@ -152,6 +168,15 @@ export function updateActionStatus(db, id, status, { last_error = null } = {}) {
   db.prepare('UPDATE actions SET status = ?, last_error = ? WHERE id = ?').run(status, last_error, id);
 }
 
+// Backwards-compatible helpers used by the runtime.
+export function listPendingActions(db, limit = 50) {
+  return listActions(db, { status: 'queued', limit });
+}
+
+export function setActionStatus(db, id, status, lastError = null) {
+  return updateActionStatus(db, id, status, { last_error: lastError });
+}
+
 export function insertActionLog(db, log) {
   db.prepare(
     'INSERT INTO action_logs (id, action_id, created_at, event, message, data_json) VALUES (?, ?, ?, ?, ?, ?)'
@@ -163,4 +188,56 @@ export function insertActionLog(db, log) {
     log.message || null,
     log.data ? JSON.stringify(log.data) : null
   );
+}
+
+export function upsertEmbedding(db, row) {
+  db.prepare(
+    'INSERT INTO embeddings (id, connector, created_at, title, url, text, vector_json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET connector=excluded.connector, created_at=excluded.created_at, title=excluded.title, url=excluded.url, text=excluded.text, vector_json=excluded.vector_json'
+  ).run(
+    row.id,
+    row.connector || null,
+    row.created_at || null,
+    row.title || null,
+    row.url || null,
+    row.text,
+    JSON.stringify(row.vector)
+  );
+}
+
+export function searchEmbeddings(db, queryVector, { limit = 10 } = {}) {
+  // Naive cosine similarity in JS. For small-ish stores this is fine.
+  const rows = db
+    .prepare('SELECT id, connector, created_at, title, url, text, vector_json FROM embeddings')
+    .all()
+    .map((r) => ({
+      ...r,
+      vector: JSON.parse(r.vector_json),
+    }));
+
+  const scored = rows
+    .map((r) => ({ ...r, score: cosineSimilarity(queryVector, r.vector) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  return scored.map((r) => {
+    const rest = { ...r };
+    delete rest.vector;
+    return rest;
+  });
+}
+
+function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return -1;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    const x = a[i];
+    const y = b[i];
+    dot += x * y;
+    na += x * x;
+    nb += y * y;
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom ? dot / denom : -1;
 }

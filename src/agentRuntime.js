@@ -11,10 +11,13 @@ import {
   setActionStatus,
 } from './store.js';
 import { analyze } from './analyzer.js';
+import { upsertEmbedding, searchEmbeddings } from './store.js';
 import { createMoltbookConnector } from './connectors/moltbook.js';
 import { createGitHubConnector } from './connectors/github.js';
 import { createWebConnector } from './connectors/web.js';
 import { createFilesConnector } from './connectors/files.js';
+import { embedText } from './embeddings.js';
+import { createLlmClient } from './llm.js';
 
 function nowIso() {
   return new Date().toISOString();
@@ -35,6 +38,15 @@ function getConfig(env) {
     storePath: env.STORE_PATH || './data/agent.db',
     readOnly: env.AGENT_READ_ONLY !== 'false',
     requireDailyApproval: env.REQUIRE_DAILY_APPROVAL !== 'false',
+    llm: {
+      enabled: env.LLM_ENABLED === 'true',
+      provider: env.LLM_PROVIDER || 'openai',
+      model: env.LLM_MODEL || '',
+    },
+    memory: {
+      embeddingsEnabled: env.EMBEDDINGS_ENABLED === 'true',
+      maxResults: Math.max(1, Math.min(25, toNumber(env.MEMORY_MAX_RESULTS, 8))),
+    },
     connectors: {
       moltbook: env.ENABLE_MOLTBOOK !== 'false',
       github: env.ENABLE_GITHUB === 'true',
@@ -51,6 +63,7 @@ function getConfig(env) {
 export function createRuntime({ logger = console } = {}) {
   const cfg = getConfig(process.env);
   const db = openStore(cfg.storePath);
+  const llm = cfg.llm.enabled ? createLlmClient(process.env, cfg.llm) : null;
 
   const connectors = {
     moltbook: createMoltbookConnector({ logger }),
@@ -109,6 +122,33 @@ export function createRuntime({ logger = console } = {}) {
 
     setState(db, 'last_report_id', reportId);
 
+    if (cfg.memory.embeddingsEnabled) {
+      try {
+        // Store embeddings for new observations so chat can retrieve older context quickly.
+        for (const o of observations) {
+          const text = [o.title, o.content].filter(Boolean).join('\n').slice(0, 4000);
+          if (!text) continue;
+          const vector = await embedText({
+            provider: cfg.memory.embeddingProvider,
+            apiKey: process.env.OPENAI_API_KEY,
+            model: process.env.OPENAI_EMBED_MODEL,
+            text,
+          });
+          upsertEmbedding(db, {
+            id: stableId('mem'),
+            connector: o.connector || o.source || 'unknown',
+            title: o.title || '',
+            url: o.url || '',
+            text,
+            created_at: o.created_at || nowIso(),
+            vector,
+          });
+        }
+      } catch (e) {
+        logger.warn?.(`[agent] embeddings update failed: ${String(e?.message || e)}`);
+      }
+    }
+
     // Propose actions (do not execute automatically).
     if (!cfg.readOnly) {
       const proposed = proposeWriteActionsFromReport({ latestReport: getLatestReport(db), cfg });
@@ -142,6 +182,66 @@ export function createRuntime({ logger = console } = {}) {
     const latest = getLatestReport(db);
     if (!latest) return { answer: 'No reports yet. The agent is still warming up.' };
 
+    const retrieved = cfg.memory.embeddingsEnabled
+      ? await (async () => {
+          try {
+            const qText = m.slice(0, 4000);
+            const qVec = await embedText({
+              provider: cfg.memory.embeddingProvider,
+              apiKey: process.env.OPENAI_API_KEY,
+              model: process.env.OPENAI_EMBED_MODEL,
+              text: qText,
+            });
+            return searchEmbeddings(db, qVec, { limit: 8 });
+          } catch {
+            return [];
+          }
+        })()
+      : [];
+
+    if (llm) {
+      const system = `You are Sephir83, an autonomous agent with connectors (Moltbook, GitHub, web, files). You must be safe.\n` +
+        `If the user requests write actions, propose them as actions but do not execute.\n` +
+        `Answer concisely with JSON containing keys: answer, proposedActions? (array), references? (array).`;
+
+      const context = {
+        latestReport: {
+          id: latest.id,
+          created_at: latest.created_at,
+          category_counts: latest.category_counts,
+          matches: (latest.matches || []).slice(0, 15),
+        },
+        pendingActions: listPendingActions(db, 20),
+        retrievedMemory: retrieved,
+        config: {
+          enabledConnectors: cfg.connectors,
+          readOnly: cfg.readOnly,
+          requireDailyApproval: cfg.requireDailyApproval,
+          writes: cfg.writes,
+        },
+      };
+
+      const completion = await llm.chat({
+        system,
+        user: `User question: ${m}\n\nContext JSON:\n${JSON.stringify(context)}`,
+      });
+
+      // If model proposes actions, enqueue them (still requires daily approval to execute).
+      const proposedActions = Array.isArray(completion?.proposedActions) ? completion.proposedActions : [];
+      if (!cfg.readOnly && proposedActions.length) {
+        for (const pa of proposedActions) {
+          enqueueAction(db, normalizeProposedAction(pa));
+        }
+      }
+      return {
+        answer: completion?.answer || completion?.text || 'Done.',
+        proposedActions,
+        references: completion?.references || [],
+        pendingActions: listPendingActions(db, 20),
+      };
+    }
+
+    // Fallback: keyword-based response.
     const lower = m.toLowerCase();
     const wantsTop = lower.includes('top') || lower.includes('most');
     const wantsGaps = lower.includes('gap');
@@ -155,17 +255,25 @@ export function createRuntime({ logger = console } = {}) {
       if (wantsReq) return x.mentions.some((mm) => mm.category === 'unsatisfiedRequests');
       return true;
     });
-
     const out = wantsTop ? filtered.slice(0, 10) : filtered.slice(0, 25);
+
     return {
       answer: 'Here are the latest matched items from my most recent run.',
-      report: {
-        id: latest.id,
-        created_at: latest.created_at,
-        category_counts: latest.category_counts,
-      },
+      report: { id: latest.id, created_at: latest.created_at, category_counts: latest.category_counts },
       items: out,
       pendingActions: listPendingActions(db, 20),
+    };
+  }
+
+  function normalizeProposedAction(pa) {
+    const id = pa.id || stableId('act');
+    return {
+      id,
+      created_at: nowIso(),
+      connector: String(pa.connector || ''),
+      action_type: String(pa.action_type || pa.type || ''),
+      payload: pa.payload || {},
+      status: 'queued',
     };
   }
 
