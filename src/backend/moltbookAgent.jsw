@@ -1,0 +1,237 @@
+const DEFAULT_KEYWORDS = {
+  gaps: [
+    'gap',
+    'missing',
+    'lack',
+    'not available',
+    "can't find",
+    'no way to',
+    'does not support',
+  ],
+  painPoints: [
+    'pain point',
+    'friction',
+    'blocked',
+    'blocker',
+    'problem',
+    'issue',
+    'difficult',
+    'hard to',
+    'slow',
+    'confusing',
+    'error',
+    'bug',
+  ],
+  unsatisfiedRequests: [
+    'request',
+    'feature request',
+    'asked for',
+    'please add',
+    'would like',
+    'need this',
+    'still waiting',
+    'not satisfied',
+    'unresolved',
+    'pending',
+    'no response',
+  ],
+};
+
+const DEFAULT_AGENT_IDENTIFIERS = ['agent', 'assistant', 'bot', 'ai'];
+
+/**
+ * Returns the defaults used by searchMoltbookDiscussions().
+ */
+export function getMoltbookSearchDefaults() {
+  return {
+    keywords: DEFAULT_KEYWORDS,
+    agentIdentifiers: DEFAULT_AGENT_IDENTIFIERS,
+  };
+}
+
+/**
+ * Search Moltbook discussion records for gaps, pain points, and unsatisfied requests.
+ * Pass in exported discussion data as params.discussions.
+ */
+export function searchMoltbookDiscussions(params = {}) {
+  const discussions = Array.isArray(params.discussions) ? params.discussions : [];
+  const onlyAgentToAgent = params.onlyAgentToAgent !== false;
+  const minimumSignals = Number.isFinite(params.minimumSignals)
+    ? Math.max(1, params.minimumSignals)
+    : 1;
+  const keywords = mergeKeywords(params.customKeywords);
+  const agentIdentifiers = Array.isArray(params.agentIdentifiers) &&
+    params.agentIdentifiers.length
+    ? params.agentIdentifiers
+    : DEFAULT_AGENT_IDENTIFIERS;
+
+  const normalized = discussions.map(normalizeDiscussion);
+  const eligible = onlyAgentToAgent
+    ? normalized.filter((discussion) => isAgentToAgent(discussion, agentIdentifiers))
+    : normalized;
+
+  const matches = eligible
+    .map((discussion) => scoreDiscussion(discussion, keywords))
+    .filter((result) => result.signalCount >= minimumSignals)
+    .sort((a, b) => b.signalCount - a.signalCount);
+
+  return {
+    summary: {
+      scannedDiscussions: normalized.length,
+      eligibleDiscussions: eligible.length,
+      matchedDiscussions: matches.length,
+      categoryCounts: summarizeCategoryCounts(matches),
+    },
+    matches,
+  };
+}
+
+function mergeKeywords(customKeywords = {}) {
+  return {
+    gaps: [...DEFAULT_KEYWORDS.gaps, ...(customKeywords.gaps || [])],
+    painPoints: [...DEFAULT_KEYWORDS.painPoints, ...(customKeywords.painPoints || [])],
+    unsatisfiedRequests: [
+      ...DEFAULT_KEYWORDS.unsatisfiedRequests,
+      ...(customKeywords.unsatisfiedRequests || []),
+    ],
+  };
+}
+
+function normalizeDiscussion(discussion = {}) {
+  const messages = Array.isArray(discussion.messages) ? discussion.messages : [];
+  const participants = Array.isArray(discussion.participants) ? discussion.participants : [];
+  const lines = [];
+
+  if (discussion.title) lines.push(String(discussion.title));
+  if (discussion.content) lines.push(String(discussion.content));
+
+  messages.forEach((message) => {
+    if (typeof message === 'string') {
+      lines.push(message);
+      return;
+    }
+
+    if (message && typeof message === 'object') {
+      const author = message.author || message.sender || message.role || '';
+      const body = message.content || message.body || message.text || '';
+      lines.push(`${author}: ${body}`.trim());
+    }
+  });
+
+  return {
+    id: discussion.id || discussion._id || discussion.slug || '',
+    title: discussion.title || '',
+    participants,
+    messages,
+    text: lines.join('\n').toLowerCase(),
+  };
+}
+
+function isAgentToAgent(discussion, agentIdentifiers) {
+  const identifiers = agentIdentifiers
+    .map((item) => String(item || '').toLowerCase())
+    .filter(Boolean);
+
+  const agentLikeAuthors = new Set();
+  const participants = discussion.participants || [];
+
+  participants.forEach((participant) => {
+    const candidate = participantToLabel(participant);
+    if (containsAnyIdentifier(candidate, identifiers)) {
+      agentLikeAuthors.add(candidate);
+    }
+  });
+
+  (discussion.messages || []).forEach((message) => {
+    const author = participantToLabel(
+      message && typeof message === 'object'
+        ? message.author || message.sender || message.role
+        : ''
+    );
+    if (containsAnyIdentifier(author, identifiers)) {
+      agentLikeAuthors.add(author);
+    }
+  });
+
+  return agentLikeAuthors.size >= 2;
+}
+
+function participantToLabel(participant) {
+  if (!participant) return '';
+  if (typeof participant === 'string') return participant.toLowerCase();
+  if (typeof participant === 'object') {
+    return String(
+      participant.name || participant.id || participant.role || participant.type || ''
+    ).toLowerCase();
+  }
+  return '';
+}
+
+function containsAnyIdentifier(text, identifiers) {
+  const source = String(text || '').toLowerCase();
+  return identifiers.some((identifier) => source.includes(identifier));
+}
+
+function scoreDiscussion(discussion, keywords) {
+  const mentions = [];
+
+  Object.entries(keywords).forEach(([category, words]) => {
+    words.forEach((word) => {
+      const count = countOccurrences(discussion.text, String(word).toLowerCase());
+      if (count > 0) {
+        mentions.push({
+          category,
+          keyword: word,
+          count,
+          excerpt: extractExcerpt(discussion.text, String(word).toLowerCase()),
+        });
+      }
+    });
+  });
+
+  return {
+    discussionId: discussion.id,
+    title: discussion.title,
+    signalCount: mentions.reduce((sum, item) => sum + item.count, 0),
+    mentions,
+  };
+}
+
+function countOccurrences(text, query) {
+  if (!query) return 0;
+  let count = 0;
+  let start = 0;
+  while (start < text.length) {
+    const idx = text.indexOf(query, start);
+    if (idx === -1) break;
+    count += 1;
+    start = idx + query.length;
+  }
+  return count;
+}
+
+function extractExcerpt(text, query) {
+  if (!query) return '';
+  const index = text.indexOf(query);
+  if (index === -1) return '';
+
+  const from = Math.max(0, index - 45);
+  const to = Math.min(text.length, index + query.length + 45);
+  return text.slice(from, to).replace(/\s+/g, ' ').trim();
+}
+
+function summarizeCategoryCounts(matches) {
+  return matches.reduce(
+    (acc, match) => {
+      match.mentions.forEach((mention) => {
+        acc[mention.category] = (acc[mention.category] || 0) + mention.count;
+      });
+      return acc;
+    },
+    {
+      gaps: 0,
+      painPoints: 0,
+      unsatisfiedRequests: 0,
+    }
+  );
+}
