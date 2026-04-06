@@ -39,7 +39,7 @@ const ConfigSchema = z.object({
 export const moltbookConnector = {
   id: 'moltbook',
   displayName: 'Moltbook',
-  readOnly: true,
+  readOnly: false,
 
   getConfig(env) {
     const parsed = ConfigSchema.parse({
@@ -128,6 +128,56 @@ export const moltbookConnector = {
       newItems: items.length,
       items,
     };
+  },
+
+  async proposeActions({ env, memory }) {
+    const cfg = this.getConfig(env);
+    const latest = memory.getLatestReport();
+    if (!latest) return [];
+
+    // Simple heuristic: if unsatisfied requests are present, propose posting a brief summary.
+    const hasRequests = (latest.matches || []).some((m) =>
+      (m.mentions || []).some((mm) => mm.category === 'unsatisfiedRequests')
+    );
+    if (!hasRequests) return [];
+
+    const top = (latest.matches || []).slice(0, 5).map((m) => ({
+      title: m.title,
+      url: m.url,
+      mentions: (m.mentions || []).slice(0, 3),
+    }));
+
+    return [
+      {
+        connector: 'moltbook',
+        type: 'moltbook.createPost',
+        summary: 'Post daily summary of top unsatisfied requests',
+        payload: {
+          baseUrl: cfg.baseUrl,
+          apiKey: cfg.apiKey,
+          submolt: env.MOLTBOOK_POST_SUBMOLT || 'general',
+          title: env.MOLTBOOK_POST_TITLE || 'Daily agent summary: requests & gaps',
+          content: `Top items:\\n\\n${top
+            .map((t, i) => `${i + 1}. ${t.title || '(no title)'} ${t.url ? `(${t.url})` : ''}`)
+            .join('\\n')}`,
+        },
+      },
+    ];
+  },
+
+  async executeAction({ action }) {
+    if (action.type !== 'moltbook.createPost') throw new Error('Unsupported action type');
+    const { baseUrl, apiKey, submolt, title, content, url } = action.payload || {};
+    if (!apiKey) throw new Error('Missing Moltbook API key');
+    const postUrl = buildUrl(baseUrl, '/posts');
+    return httpJson(postUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ submolt, title, content, url }),
+    });
   },
 };
 

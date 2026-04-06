@@ -1,6 +1,15 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import crypto from 'node:crypto';
-import { openStore, getState, setState, insertReport, getLatestReport } from './store.js';
+import {
+  openStore,
+  getState,
+  setState,
+  insertReport,
+  getLatestReport,
+  enqueueAction,
+  listPendingActions,
+  setActionStatus,
+} from './store.js';
 import { analyze } from './analyzer.js';
 import { createMoltbookConnector } from './connectors/moltbook.js';
 import { createGitHubConnector } from './connectors/github.js';
@@ -25,11 +34,16 @@ function getConfig(env) {
     pollSeconds: Math.max(30, toNumber(env.POLL_SECONDS, 300)),
     storePath: env.STORE_PATH || './data/agent.db',
     readOnly: env.AGENT_READ_ONLY !== 'false',
+    requireDailyApproval: env.REQUIRE_DAILY_APPROVAL !== 'false',
     connectors: {
       moltbook: env.ENABLE_MOLTBOOK !== 'false',
       github: env.ENABLE_GITHUB === 'true',
       web: env.ENABLE_WEB === 'true',
       files: env.ENABLE_FILES === 'true',
+    },
+    writes: {
+      moltbook: env.MOLTBOOK_WRITE === 'true',
+      github: env.GITHUB_WRITE === 'true',
     },
   };
 }
@@ -51,6 +65,8 @@ export function createRuntime({ logger = console } = {}) {
     lastError: null,
     enabled: cfg.connectors,
     readOnly: cfg.readOnly,
+    requireDailyApproval: cfg.requireDailyApproval,
+    writes: cfg.writes,
   };
 
   let started = false;
@@ -92,6 +108,14 @@ export function createRuntime({ logger = console } = {}) {
     });
 
     setState(db, 'last_report_id', reportId);
+
+    // Propose actions (do not execute automatically).
+    if (!cfg.readOnly) {
+      const proposed = proposeWriteActionsFromReport({ latestReport: getLatestReport(db), cfg });
+      for (const action of proposed) {
+        enqueueAction(db, action);
+      }
+    }
     return { reportId, analysis };
   }
 
@@ -141,12 +165,94 @@ export function createRuntime({ logger = console } = {}) {
         category_counts: latest.category_counts,
       },
       items: out,
+      pendingActions: listPendingActions(db, 20),
     };
+  }
+
+  function approveForToday({ approvedBy = 'user' } = {}) {
+    const today = new Date().toISOString().slice(0, 10);
+    setState(db, 'approval.daily.date', today);
+    setState(db, 'approval.daily.by', String(approvedBy || 'user'));
+    setState(db, 'approval.daily.at', nowIso());
+    return { ok: true, approvedForDate: today };
+  }
+
+  function isApprovedToday() {
+    const today = new Date().toISOString().slice(0, 10);
+    const approvedDate = getState(db, 'approval.daily.date', null);
+    return approvedDate === today;
+  }
+
+  async function executePendingActions({ limit = 10 } = {}) {
+    if (cfg.readOnly) throw new Error('Agent is in read-only mode');
+    if (cfg.requireDailyApproval && !isApprovedToday()) {
+      throw new Error('Daily approval required before executing actions');
+    }
+
+    const pending = listPendingActions(db, limit);
+    const results = [];
+
+    for (const a of pending) {
+      try {
+        const connectorId = a.connector;
+        const connector = connectors[connectorId];
+        if (!connector) throw new Error(`Unknown connector: ${connectorId}`);
+        if (connectorId === 'github' && !cfg.writes.github) throw new Error('GitHub writes disabled');
+        if (connectorId === 'moltbook' && !cfg.writes.moltbook) throw new Error('Moltbook writes disabled');
+
+        if (typeof connector.executeAction !== 'function') {
+          throw new Error(`Connector does not support executeAction(): ${connectorId}`);
+        }
+
+        setActionStatus(db, a.id, 'running', null);
+        const out = await connector.executeAction({ env: process.env, db, cfg, action: a });
+        setActionStatus(db, a.id, 'succeeded', null);
+        results.push({ id: a.id, ok: true, result: out });
+      } catch (e) {
+        const msg = String(e?.message || e);
+        setActionStatus(db, a.id, 'failed', msg);
+        results.push({ id: a.id, ok: false, error: msg });
+      }
+    }
+
+    return { ok: true, executed: results.length, results };
+  }
+
+  function proposeWriteActionsFromReport({ latestReport, cfg: runtimeCfg }) {
+    if (!latestReport || !Array.isArray(latestReport.matches)) return [];
+    const actions = [];
+
+    // Very conservative default: only propose, never execute without explicit enable flags.
+    if (runtimeCfg.writes.github) {
+      // If there are unsatisfiedRequests, propose opening a GitHub issue as a placeholder.
+      const hasUnsatisfied = latestReport.matches.some((m) =>
+        (m.mentions || []).some((mm) => mm.category === 'unsatisfiedRequests')
+      );
+      if (hasUnsatisfied) {
+        actions.push({
+          connector: 'github',
+          kind: 'issue.create',
+          title: 'Agent: review unsatisfied requests detected',
+          payload: {
+            title: 'Agent: review unsatisfied requests detected',
+            body: `Auto-generated placeholder from report ${latestReport.id} (${latestReport.created_at}).\n\nTop matches:\n` +
+              latestReport.matches
+                .slice(0, 5)
+                .map((m) => `- ${m.title || m.id} (${m.url || ''})`)
+                .join('\n'),
+          },
+        });
+      }
+    }
+
+    return actions;
   }
 
   return {
     loop,
     chat,
+    approveForToday,
+    executePendingActions,
     getStatus: () => ({ ...status, latestReport: getLatestReport(db) }),
   };
 }

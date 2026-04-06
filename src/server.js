@@ -31,6 +31,25 @@ app.get('/api/status', async (req, res) => {
   res.json({ ok: true, status: agent.getStatus() });
 });
 
+app.post('/api/approve', async (req, res) => {
+  try {
+    const result = await agent.approveToday();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+app.post('/api/actions/execute', async (req, res) => {
+  try {
+    const { ids } = req.body || {};
+    const result = await agent.executeActions(Array.isArray(ids) ? ids : null);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
 app.post('/api/chat', async (req, res) => {
   try {
     const { message, question } = req.body || {};

@@ -33,6 +33,23 @@ export function renderChatHome({ status }) {
     ? `<pre class="card"><span class="muted">Agent status</span>\n${escapeHtml(JSON.stringify(status, null, 2))}</pre>`
     : `<div class="card muted">No status yet. Worker may still be warming up.</div>`;
 
+  const approval = status?.approval || null;
+  const approvalHtml = approval
+    ? `<div class="card">
+         <h1>Daily approval</h1>
+         <div class="muted">Writes are blocked unless approved for today (UTC).</div>
+         <div style="height:10px"></div>
+         <pre class="muted">${escapeHtml(JSON.stringify(approval, null, 2))}</pre>
+         <div style="height:10px"></div>
+         <div class="row">
+           <button id="approve">Approve writes for today (UTC)</button>
+           <button id="exec">Execute queued actions</button>
+         </div>
+         <div style="height:10px"></div>
+         <pre id="actionsOut" class="card muted">Action results will appear here.</pre>
+       </div>`
+    : `<div class="card muted">Approval status not available yet.</div>`;
+
   return renderPage({
     title: 'Sephir83 — Autonomous Agent',
     bodyHtml: `
@@ -52,11 +69,16 @@ export function renderChatHome({ status }) {
         </div>
       </div>
       <div style="height:16px"></div>
+      ${approvalHtml}
+      <div style="height:16px"></div>
       ${statusHtml}
       <script>
         const q = document.getElementById('q');
         const out = document.getElementById('out');
         const send = document.getElementById('send');
+        const actionsOut = document.getElementById('actionsOut');
+        const approveBtn = document.getElementById('approve');
+        const execBtn = document.getElementById('exec');
         async function ask() {
           const question = q.value.trim();
           if (!question) return;
@@ -70,10 +92,28 @@ export function renderChatHome({ status }) {
           const data = await res.json().catch(() => ({}));
           out.textContent = JSON.stringify(data, null, 2);
         }
+        async function approve() {
+          if (!approveBtn || !actionsOut) return;
+          actionsOut.classList.remove('muted');
+          actionsOut.textContent = 'Approving...';
+          const res = await fetch('/api/approve', { method: 'POST' });
+          const data = await res.json().catch(() => ({}));
+          actionsOut.textContent = JSON.stringify(data, null, 2);
+        }
+        async function executeActions() {
+          if (!execBtn || !actionsOut) return;
+          actionsOut.classList.remove('muted');
+          actionsOut.textContent = 'Executing...';
+          const res = await fetch('/api/actions/execute', { method: 'POST' });
+          const data = await res.json().catch(() => ({}));
+          actionsOut.textContent = JSON.stringify(data, null, 2);
+        }
         send.addEventListener('click', ask);
         q.addEventListener('keydown', (e) => {
           if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') ask();
         });
+        if (approveBtn) approveBtn.addEventListener('click', approve);
+        if (execBtn) execBtn.addEventListener('click', executeActions);
       </script>
     `,
   });
